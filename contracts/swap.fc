@@ -1,0 +1,96 @@
+#include "imports/stdlib.fc";
+
+;;
+;; Common
+;;
+
+const int msg_flag::bounceable = 0x18;
+
+builder store_zeros(builder b, int n) asm "STZEROES";
+
+slice addr_none() asm "b{00} PUSHSLICE";
+
+;;
+;; DEX
+;;
+
+;; const slice TON_VAULT_ADDR = "EQDa4VOnTYlLvDJ0gZjNYm5PXfSmmtL6Vs6A_CZEtXCNICq_"a;
+const slice TON_VAULT_ADDR = "kQDLcce6SZW3lk39MubJ55w5v8Lt-EBs60EapzNyrKHQ0ERz"a; ;; test-net
+
+;; Where to send bought jettons?
+;; const slice RECIPIENT_ADDR = "UQCJRXURe73Ekjy5DDbWpgkgqnAv5eEns9PD_ueyIQee9zlm"a;
+const slice RECIPIENT_ADDR = my_address();
+
+;; Can be taken from DeDust.io: https://dedust.io/earn/<pool_addr>
+;; const slice TON_SCALE_POOL_ADDR = "EQDcm06RlreuMurm-yik9WbL6kI617B77OrSRF_ZjoCYFuny"a;
+const slice TON_SCALE_POOL_ADDR = "kQDBJdRJ-meLncmzyIrLykEofIfpFPmxOlkxZoc8zWNR1zn-"a;
+
+const int MIN_BALANCE = 100000000; ;; 0.1 TON
+const int MIN_TRADE_AMOUNT = 1000000000; ;; 1 TON
+const int TRADE_FEE = 200000000; ;; 0.2 TON
+
+;; const int ton_vault::swap = 0xea06185d;
+int op::ton_vault_swap() asm "0xea06185d PUSHINT";
+
+
+{---  the main contract part  ---}
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
+    slice cs = in_msg_full.begin_parse();
+    int flags = cs~load_uint(4);
+    if (flags & 1) {
+        ;; NOTE: Ignore bounced messages.
+        return ();
+    }
+
+    int trade_value = my_balance - MIN_BALANCE;
+    if (trade_value < MIN_TRADE_AMOUNT + TRADE_FEE) {
+        ;; NOTE: Ignore messages if balance is too low.
+        return ();
+    }
+
+    {-
+        timestamp#_ _:uint32 = Timestamp;
+
+        step_params#_ kind:SwapKind limit:Coins next:(Maybe ^SwapStep) = SwapStepParams;
+        step#_ pool_addr:MsgAddressInt params:SwapStepParams = SwapStep;
+
+        swap_params#_ deadline:Timestamp recipient_addr:MsgAddressInt referral_addr:MsgAddress
+                      fulfill_payload:(Maybe ^Cell) reject_payload:(Maybe ^Cell) = SwapParams;
+
+        swap#ea06185d query_id:uint64 amount:Coins _:SwapStep swap_params:^SwapParams = InMsgBody;
+    -}
+
+    cell swap_param = begin_cell()
+                        .store_uint(now() + 60 * 5, 32)  ;; deadline:Timestamp # 5 min
+                        .store_slice(RECIPIENT_ADDR)     ;; recipient_addr:MsgAddressInt
+                        .store_slice(addr_none())        ;; referral_addr:MsgAddress
+                        .store_maybe_ref(null())         ;; fulfill_payload:(Maybe ^Cell)
+                        .store_maybe_ref(null())         ;; reject_payload:(Maybe ^Cell)
+                    .end_cell();
+
+    cell body = begin_cell()
+                    .store_uint(op::ton_vault_swap(), 32)
+                    .store_uint(0, 64) ;; query_id:int64
+                    .store_coins(trade_value - TRADE_FEE) ;; amount:Coins # subtract gas
+                    
+                    ;; _:SwapStep
+                    .store_slice(TON_SCALE_POOL_ADDR) ;; pool_addr:MsgAddressInt
+                    .store_uint(0, 1)                 ;; kind:SwapKind
+                    .store_coins(0)                   ;; limit:Coins
+                    .store_maybe_ref(null())          ;; next:(Maybe ^SwapStep)
+                    
+                    ;; swap_params:^SwapParams
+                    .store_ref(swap_param)
+                .end_cell();
+
+    send_raw_message(
+        begin_cell()
+            .store_uint(msg_flag::bounceable, 6)
+            .store_slice(TON_VAULT_ADDR)
+            .store_coins(trade_value)
+            .store_zeros(1 + 4 + 4 + 64 + 32 + 1)
+            .store_maybe_ref(body)
+        .end_cell(),
+        0
+    );
+}
