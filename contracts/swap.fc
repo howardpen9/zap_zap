@@ -1,19 +1,27 @@
 #include "imports/stdlib.fc";
 
+;; (slice, int) dict_get?(cell dict, int key_len, slice key) asm(key dict key_len) "DICTGET" "NULLSWAPIFNOT";
+;; (cell, int) dict_get_ref?(cell dict, int key_len, slice key) asm(key dict key_len) "DICTGETREF" "NULLSWAPIFNOT";
+;; (cell, ()) ~dict_set_ref(cell dict, int key_len, slice index, cell key) asm(key dict index key_len) "DICTSETREF" "NULLSWAPIFNOT";
+
 ;;
 ;; Common
 ;;
+const error::stillPending = 444;
+const error::notDepositor = 445;
 
 const int msg_flag::bounceable = 0x18;
 builder store_zeros(builder b, int n) asm "STZEROES";
 slice addr_none() asm "b{00} PUSHSLICE";
 
 const int MIN_BALANCE = 100000000; ;; 0.1 TON
-const int MIN_TRADE_AMOUNT = 1000000000; ;; 1 TON
-const int TRADE_FEE = 200000000; ;; 0.2 TON
+const int MIN_TRADE_AMOUNT = 500000000; ;; 0.5 TON
+;; const int TRADE_FEE = 200000000; ;; 0.2 TON
 
 ;; const int ton_vault::swap = 0xea06185d;
 int op::ton_vault_swap() asm "0xea06185d PUSHINT";
+int op::jetton_notify() asm "0x7362d09c PUSHINT";
+
 
 ;;
 ;; DEX
@@ -22,13 +30,29 @@ int op::ton_vault_swap() asm "0xea06185d PUSHINT";
 ;; const slice TON_VAULT_ADDR = "EQDa4VOnTYlLvDJ0gZjNYm5PXfSmmtL6Vs6A_CZEtXCNICq_"a; ;; main-net
 const slice TON_VAULT_ADDR = "kQDLcce6SZW3lk39MubJ55w5v8Lt-EBs60EapzNyrKHQ0ERz"a; ;; test-net
 
-;; Where to send bought jettons?
-const slice RECIPIENT_ADDR = "UQCJRXURe73Ekjy5DDbWpgkgqnAv5eEns9PD_ueyIQee9zlm"a; ;; test-net Receiver 
-;; const slice RECIPIENT_ADDR = my_address();
-
 ;; Can be taken from DeDust.io: https://dedust.io/earn/<pool_addr>
 ;; const slice TON_SCALE_POOL_ADDR = "EQDcm06RlreuMurm-yik9WbL6kI617B77OrSRF_ZjoCYFuny"a; ;; main-net
 const slice TON_SCALE_POOL_ADDR = "kQDBJdRJ-meLncmzyIrLykEofIfpFPmxOlkxZoc8zWNR1zn-"a; ;; test-net
+
+;; Where to send bought jettons?
+const slice TREASURY_ADDR = "UQCJRXURe73Ekjy5DDbWpgkgqnAv5eEns9PD_ueyIQee9zlm"a; ;; test-net Receiver 
+;; const slice RECIPIENT_ADDR = my_address();
+
+
+global cell storage::senders_balance;
+
+() load_data() impure inline_ref {
+    slice ds = get_data().begin_parse();
+    storage::senders_balance = ds~load_ref();
+}
+
+() save_data(cell senders_balance) impure inline_ref {
+    set_data(
+        begin_cell()
+            .store_dict(senders_balance)
+        .end_cell()
+    );
+}
 
 ;;
 ;; Main contract
@@ -42,7 +66,13 @@ const slice TON_SCALE_POOL_ADDR = "kQDBJdRJ-meLncmzyIrLykEofIfpFPmxOlkxZoc8zWNR1
         return ();
     }
     slice sender_address = cs~load_msg_addr(); ;; get the sender address
+    
+    int op = -1;
+    if (in_msg_body.slice_bits()) {
+        (int op, int query_id) = (in_msg_body~load_uint(32), in_msg_body~load_uint(64));
+    }   
 
+    int TRADE_FEE = muldiv(msg_value, 10, 100);
     int trade_value = my_balance - MIN_BALANCE;
     if (trade_value < MIN_TRADE_AMOUNT + TRADE_FEE) {
         ;; NOTE: Ignore messages if balance is too low.
@@ -50,60 +80,96 @@ const slice TON_SCALE_POOL_ADDR = "kQDBJdRJ-meLncmzyIrLykEofIfpFPmxOlkxZoc8zWNR1
         return ();
     }
 
-    {-
-        timestamp#_ _:uint32 = Timestamp;
+    load_data();    
 
-        step_params#_ kind:SwapKind limit:Coins next:(Maybe ^SwapStep) = SwapStepParams;
-        step#_ pool_addr:MsgAddressInt params:SwapStepParams = SwapStep;
+    if (op == op::jetton_notify()) {
+        int jetton_amount = in_msg_body~load_uint(32);
+        slice from_address = in_msg_body~load_msg_addr();
+        cell forward_payload = in_msg_body~load_maybe_ref();
 
-        swap_params#_ deadline:Timestamp recipient_addr:MsgAddressInt referral_addr:MsgAddress
-                      fulfill_payload:(Maybe ^Cell) reject_payload:(Maybe ^Cell) = SwapParams;
+        slice ds = forward_payload.begin_parse();
+        ds~load_uint(1); ;; 1 - success, 0 - fail
+        slice to_address = ds~load_slice();
 
-        swap#ea06185d query_id:uint64 amount:Coins _:SwapStep swap_params:^SwapParams = InMsgBody;
-    -}
-    cell swap_param = begin_cell()
-                        .store_uint(now() + 60 * 5, 32)  ;; deadline:Timestamp # 5 min
-                        .store_slice(sender_address)     ;; recipient_addr:MsgAddressInt
-                        .store_slice(addr_none())        ;; referral_addr:MsgAddress
-                        .store_maybe_ref(null())         ;; fulfill_payload:(Maybe ^Cell)
-                        .store_maybe_ref(null())         ;; reject_payload:(Maybe ^Cell)
+        ;; Send the AddingLiquidity message to the pool
+        (slice balance, int found) = storage::senders_balance.dict_get?(267, to_address);
+        throw_unless(error::notDepositor, found);
+
+        ;; send amountOfTonBuying to the ton-vault
+
+        ;; send jetton_amount from JettonWallet to the jetton-vault (jettonVault: deposit, 0x40e108d6)
+    }
+
+    if (op == -1) {
+        (slice balance, int found) = storage::senders_balance.dict_get?(267, sender_address);
+        throw_unless(error::stillPending, found);
+        {-
+            timestamp#_ _:uint32 = Timestamp;
+
+            step_params#_ kind:SwapKind limit:Coins next:(Maybe ^SwapStep) = SwapStepParams;
+            step#_ pool_addr:MsgAddressInt params:SwapStepParams = SwapStep;
+
+            swap_params#_ deadline:Timestamp recipient_addr:MsgAddressInt referral_addr:MsgAddress
+                        fulfill_payload:(Maybe ^Cell) reject_payload:(Maybe ^Cell) = SwapParams;
+
+            swap#ea06185d query_id:uint64 amount:Coins _:SwapStep swap_params:^SwapParams = InMsgBody;
+        -}
+        int amountOfTonBuying = (trade_value - TRADE_FEE) / 2;
+        ~dump(amountOfTonBuying);
+        storage::senders_balance~dict_set_ref(267, sender_address, begin_cell().store_coins(amountOfTonBuying).end_cell());
+        
+        cell custom_payload = begin_cell()
+                                .store_uint(1, 1)
+                                .store_slice(sender_address)
+                                .store_coins(amountOfTonBuying)
+                            .end_cell();
+
+        cell swap_param = begin_cell()
+                            .store_uint(now() + 60 * 5, 32)  ;; deadline:Timestamp # 5 min
+                            .store_slice(my_address())       ;; recipient_addr:MsgAddressInt, receipt for the SCALE token 
+                            .store_slice(TREASURY_ADDR)        ;; referral_addr:MsgAddress
+                            .store_maybe_ref(custom_payload)  ;; fulfill_payload:(Maybe ^Cell)
+                            .store_maybe_ref(null())         ;; reject_payload:(Maybe ^Cell)
+                        .end_cell();
+
+        cell body = begin_cell()
+                        .store_uint(op::ton_vault_swap(), 32) ;; 0xea06185d
+                        .store_uint(0, 64)                    ;; query_id:int64
+                        .store_coins(amountOfTonBuying) ;; amount:Coins # subtract gas
+                        
+                        ;; _:SwapStep
+                        .store_slice(TON_SCALE_POOL_ADDR) ;; pool_addr:MsgAddressInt
+                        .store_uint(0, 1)                 ;; kind:SwapKind
+                        .store_coins(0)                   ;; limit:Coins
+                        .store_maybe_ref(null())          ;; next:(Maybe ^SwapStep)
+                        ;; swap_params:^SwapParams
+                        .store_ref(swap_param)
                     .end_cell();
 
-    cell body = begin_cell()
-                    .store_uint(op::ton_vault_swap(), 32) ;; 0xea06185d
-                    .store_uint(0, 64)                    ;; query_id:int64
-                    .store_coins(trade_value - TRADE_FEE) ;; amount:Coins # subtract gas
-                    
-                    ;; _:SwapStep
-                    .store_slice(TON_SCALE_POOL_ADDR) ;; pool_addr:MsgAddressInt
-                    .store_uint(0, 1)                 ;; kind:SwapKind
-                    .store_coins(0)                   ;; limit:Coins
-                    .store_maybe_ref(null())          ;; next:(Maybe ^SwapStep)
-                    
-                    ;; swap_params:^SwapParams
-                    .store_ref(swap_param)
-                .end_cell();
+        send_raw_message(
+            begin_cell()
+                .store_uint(msg_flag::bounceable, 6)
+                .store_slice(TON_VAULT_ADDR)
+                .store_coins(trade_value)
+                .store_zeros(1 + 4 + 4 + 64 + 32 + 1)
+                .store_maybe_ref(body)
+            .end_cell(),
+            0
+        );
 
-    send_raw_message(
-        begin_cell()
-            .store_uint(msg_flag::bounceable, 6)
-            .store_slice(TON_VAULT_ADDR)
-            .store_coins(trade_value)
-            .store_zeros(1 + 4 + 4 + 64 + 32 + 1)
-            .store_maybe_ref(body)
-        .end_cell(),
-        0
-    );
+        ;; raw_reserve(50000000, 2); ;; Keep 0.05 TON as storage Reserve. 50_000_000 means 0.05 TON
+        ;; send_raw_message(
+        ;;     begin_cell()
+        ;;         .store_uint(msg_flag::bounceable, 6)
+        ;;         .store_slice(TREASURY_ADDR)
+        ;;         .store_coins(0)
+        ;;         .store_zeros(1 + 4 + 4 + 64 + 32 + 1)
+        ;;         .store_maybe_ref(begin_cell().store_uint(0, 32).store_slice("To the owner").end_cell())
+        ;;     .end_cell(),
+        ;;     128
+        ;; );
+    }
 
-    raw_reserve(50000000, 2); ;; Keep 0.05 TON as storage Reserve. 50_000_000 means 0.05 TON
-    send_raw_message(
-        begin_cell()
-            .store_uint(msg_flag::bounceable, 6)
-            .store_slice(RECIPIENT_ADDR)
-            .store_coins(0)
-            .store_zeros(1 + 4 + 4 + 64 + 32 + 1)
-            .store_maybe_ref(begin_cell().store_uint(0, 32).store_slice("To the owner").end_cell())
-        .end_cell(),
-        128
-    );
+    ;; }
+    ;; throw(0xffff);
 }

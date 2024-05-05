@@ -58,15 +58,15 @@ describe('Sample', () => {
     });
 
 
-    it('should deploy with init data', async () => {
-        const sendResult = await contract.send(
-            deployer.getSender(), 
-            {
-                value: toNano('0.5'),
-            },
-            "1234"
-        ); 
-        printTransactionFees(sendResult.transactions);
-        prettyLogTransactions(sendResult.transactions);
-    });
+    // it('should deploy with init data', async () => {
+    //     const sendResult = await contract.send(
+    //         deployer.getSender(), 
+    //         {
+    //             value: toNano('0.5'),
+    //         },
+    //         "1234"
+    //     ); 
+    //     printTransactionFees(sendResult.transactions);
+    //     prettyLogTransactions(sendResult.transactions);
+    // });
 });

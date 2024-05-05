@@ -1,20 +1,13 @@
 import { beginCell, toNano } from '@ton/core';
-import { Swap } from '../wrappers/Swap';
 import { compile, NetworkProvider } from '@ton/blueprint';
+import { Swap } from '../wrappers/Swap';
 
 export async function run(provider: NetworkProvider) {
     const minter = provider.open(
         await Swap.createFromConfig(
             provider.sender().address!!, 
-        await compile('Jetton'))
+        await compile('Swap'))
     );
-
-    // let init_data = beginCell()
-    //     .storeCoins(1000000n) // Total Supply
-    //     .storeAddress(provider.sender().address!!)
-    //     .storeRef(beginCell().endCell())
-    //     .storeRef(await compile('JettonWallet'))
-    //     .endCell();
 
     await minter.sendDeploy(
         provider.sender(),
